@@ -1,0 +1,1077 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Varya</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;800&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+  #ov { position: fixed; inset: 0; pointer-events: none; }
+  #start {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #000; color: #ff5c8a; font: 500 15px "JetBrains Mono", monospace; letter-spacing: .15em;
+    cursor: pointer; -webkit-tap-highlight-color: transparent; user-select: none;
+  }
+  #start span { animation: pulse 1.6s ease-in-out infinite; }
+  #start[hidden] { display: none; }
+  @keyframes pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="ov"></canvas>
+<div id="start"><span>♥ коснись ♥</span></div>
+<script>
+(() => {
+'use strict';
+
+// ---------- settings ----------
+const RAMP   = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+const FONT   = '"JetBrains Mono", Consolas, "Courier New", monospace';
+const NAMES  = "Исламчик·Варюша·";   // photos and "Я тебя люблю" are written with these
+const HEART_NAMES = "Исламчик·Варюша·";   // the beating heart star
+const LOVE   = "Я ТЕБЯ ЛЮБЛЮ";
+const HINT   = "коснись звезды";
+
+// photos sit on stars of Scorpius (her constellation); src: null -> placeholder picture
+// side: where the little photo hangs relative to its star (up / down / left / right)
+// crop: part of the picture to use, in fractions
+const PHOTOS = [
+  { star: 'Acrab',   side: 'up',    src: '1.jpg', crop: { x: 0.12, y: 0.33, w: 0.88, h: 0.67 } },
+  { star: 'Fang',    side: 'right', src: '2.jpg', crop: { x: 0.10, y: 0.30, w: 0.90, h: 0.70 } },
+  { star: 'Larawag', side: 'left',  src: '3.jpg', crop: { x: 0,    y: 0.18, w: 1,    h: 0.80 } },
+  { star: 'Mu',      side: 'right', src: '4.jpg', crop: { x: 0.30, y: 0,    w: 0.70, h: 1    } },
+  { star: 'Eta',     side: 'down',  src: '5.jpg' },
+  { star: 'Sargas',  side: 'down',  src: '6.jpg' },
+  { star: 'Shaula',  side: 'up',    src: '7.jpg', crop: { x: 0,    y: 0.25, w: 1,    h: 0.60 } },
+];
+const HEART_STAR = 'Antares';   // "the heart of the Scorpion" -> opens "Я тебя люблю"
+
+const QS = new URLSearchParams(location.search);
+
+// timeline, seconds
+const T = {
+  open0: 2.4, open1: 4.6,      // eye opens
+  blink0: 7.3, blink1: 7.8,    // one blink
+  zoom: 8.2, zoomLen: 3.2,     // dive into the pupil
+  sky: 11.4,                   // Scorpius stars light up
+  lines0: 12.6, lines1: 15.0,  // constellation lines are drawn
+  thumbs: 15.6,                // little photos appear over the stars
+  hint: 17.5,                  // "коснись звезды"
+};
+
+// ---------- charset ----------
+const CHARS = [...new Set(RAMP + NAMES + HEART_NAMES + LOVE + HINT + ".:*+-|/\\")];
+const CI = new Map(CHARS.map((c, i) => [c, i]));
+const RI = Array.from(RAMP, c => CI.get(c));
+const NI = Array.from(NAMES, c => CI.get(c));
+const HI = Array.from(HEART_NAMES, c => CI.get(c));
+const NR = RI.length;
+const SP = CI.get(' '), C_DOT = CI.get('.'), C_COL = CI.get(':'), C_STAR = CI.get('*'),
+      C_PLUS = CI.get('+'), C_H = CI.get('-'), C_V = CI.get('|'), C_SL = CI.get('/'), C_BS = CI.get('\\');
+
+// ---------- math ----------
+const clamp01 = x => x < 0 ? 0 : x > 1 ? 1 : x;
+const mix = (a, b, t) => a + (b - a) * t;
+function ss(a, b, x) { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); }
+function hash(x, y) {
+  let n = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  n ^= n >>> 16;
+  return (n >>> 0) / 4294967296;
+}
+
+// tileable fbm value-noise textures, sampled bilinearly
+const TN = 256;
+function makeFbm(seed, base, oct) {
+  const out = new Float32Array(TN * TN);
+  let amp = 1;
+  for (let o = 0; o < oct; o++, amp *= 0.5) {
+    const f = base << o, cs = TN / f, s = seed * 1013 + o * 7919;
+    for (let y = 0; y < TN; y++) {
+      const gy = y / cs, y0 = Math.floor(gy), fy = gy - y0, sy = fy * fy * (3 - 2 * fy), y1 = (y0 + 1) % f;
+      for (let x = 0; x < TN; x++) {
+        const gx = x / cs, x0 = Math.floor(gx), fx = gx - x0, sx = fx * fx * (3 - 2 * fx), x1 = (x0 + 1) % f;
+        const a = hash(x0 + s, y0 - s), b = hash(x1 + s, y0 - s), c = hash(x0 + s, y1 - s), d = hash(x1 + s, y1 - s);
+        out[y * TN + x] += mix(mix(a, b, sx), mix(c, d, sx), sy) * amp;
+      }
+    }
+  }
+  let lo = Infinity, hi = -Infinity;
+  for (const v of out) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  for (let i = 0; i < out.length; i++) out[i] = (out[i] - lo) / (hi - lo);
+  return out;
+}
+function bil(t, x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+  const x0 = xi & 255, y0 = yi & 255, x1 = (x0 + 1) & 255, y1 = (y0 + 1) & 255;
+  const a = t[y0 * TN + x0], b = t[y0 * TN + x1], c = t[y1 * TN + x0], d = t[y1 * TN + x1];
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+const TS = makeFbm(1, 8, 5);   // skin pores, planet surface
+const TW = makeFbm(7, 16, 4);  // fibers, veins, hair
+
+// ---------- eye ----------
+const E = { ou: 0, cx: 0, cy: -0.08, gx: 0, gy: 0, rp: 0.105, hl: 1 };
+const EO = { r: 0, g: 0, b: 0, pm: 0 };
+
+function shadeEye(x, y) {
+  const xx = x / 0.95, k = Math.max(0, 1 - xx * xx), ou = E.ou;
+  const yc  = 0.05 * k - 0.02 - 0.035 * xx;
+  const yUp = yc - 0.46 * ou * Math.pow(k, 0.8) + 0.45 * E.gy * ou * k;   // lids follow the gaze
+  const yLo = yc + 0.17 * ou * Math.pow(k, 1.1) + 0.2 * E.gy * ou * k;
+  let r, g, b, pm = 0;
+
+  if (k > 0 && y > yUp && y < yLo) {
+    const du = y - yUp, dl = yLo - y;
+    // sclera
+    const s = 1 - 0.5 * xx * xx;
+    r = 0.88 * s; g = 0.83 * s; b = 0.80 * s;
+    const vn = ss(0.58, 0.8, bil(TW, x * 70 + 20, y * 70 + 70)) * 0.6 * xx * xx;
+    r = mix(r, 0.72, vn); g = mix(g, 0.26, vn); b = mix(b, 0.25, vn);
+    const car = ss(-0.74, -0.93, xx);
+    r = mix(r, 0.80, car); g = mix(g, 0.42, car); b = mix(b, 0.40, car);
+    // iris + pupil
+    // iris is a disc on a sphere: it narrows when the eye turns away
+    const fx = Math.sqrt(1 - (E.gx / 0.8) ** 2), fy = Math.sqrt(1 - (E.gy / 0.8) ** 2);
+    const dx = x - E.cx, dy = y - E.cy, rr = Math.hypot(dx / fx, dy / fy), ir = rr / 0.30;
+    if (ir < 1.05) {
+      const a = (Math.atan2(dy, dx) / (2 * Math.PI) + 0.5) * 1024;
+      const fib = 0.6 * bil(TW, a, rr * 45 + 10) + 0.4 * bil(TS, a * 0.5, rr * 90 + 40);
+      const m = ss(0.3, 0.95, ir);
+      const f = (0.35 + 0.7 * fib) * (1 + 0.3 * Math.exp(-(((ir - 0.5) / 0.08) ** 2))) * (1 - 0.8 * ss(0.8, 1.0, ir));
+      const im = ss(1.03, 0.97, ir);
+      r = mix(r, mix(0.86, 0.34, m) * f, im);
+      g = mix(g, mix(0.55, 0.17, m) * f, im);
+      b = mix(b, mix(0.20, 0.07, m) * f, im);
+      pm = ss(E.rp * 1.05, E.rp * 0.95, rr);
+      r = mix(r, 0.01, pm); g = mix(g, 0.01, pm); b = mix(b, 0.015, pm);
+    }
+    // catchlights
+    if (E.hl > 0) {
+      // catchlights move less than the iris
+      const hx = dx + 0.6 * E.gx, hy = dy + 0.6 * E.gy;
+      const h = (Math.exp(-((hx + 0.10) ** 2 + (hy + 0.11) ** 2) / 0.0011)
+              + 0.5 * Math.exp(-((hx - 0.08) ** 2 + (hy - 0.06) ** 2) / 0.0003)) * E.hl;
+      r += h; g += h; b += h;
+    }
+    // lid shadow, waterline
+    const sh = 0.3 + 0.7 * ss(0, 0.11, du);
+    r *= sh; g *= sh; b *= sh;
+    const wl = Math.exp(-((dl / 0.018) ** 2)) * 0.7;
+    r = mix(r, 0.80, wl); g = mix(g, 0.45, wl); b = mix(b, 0.42, wl);
+  } else {
+    // skin
+    const tx = bil(TS, x * 90 + 100, y * 90 + 100), tx2 = bil(TW, x * 22 + 30, y * 22 + 5);
+    const f = (0.78 + 0.36 * tx) * (0.88 + 0.24 * tx2) * (1 + 0.12 * Math.exp(-(((y + 0.56) / 0.2) ** 2)));
+    r = 0.62 * f; g = 0.40 * f; b = 0.29 * f;
+
+    if (k > 0) {
+      if (y <= yUp) {
+        const d = yUp - y;
+        const crPos = (0.10 + 0.08 * ou) * Math.pow(k, 0.5);
+        const c = Math.exp(-(((d - crPos) / 0.022) ** 2)) * 0.4 * ss(0, 0.25, k);
+        r *= 1 - c; g *= 1 - c; b *= 1 - c;
+        const lm = Math.exp(-((d / 0.02) ** 2)) * 0.6 * ss(0, 0.3, ou);
+        r = mix(r, 0.66, lm); g = mix(g, 0.36, lm); b = mix(b, 0.32, lm);
+      } else {
+        const d = y - yLo;
+        const lm = Math.exp(-((d / 0.022) ** 2)) * 0.6 * ss(0, 0.3, ou);
+        r = mix(r, 0.72, lm); g = mix(g, 0.42, lm); b = mix(b, 0.38, lm);
+        const ue = Math.exp(-(((d - 0.12) / 0.07) ** 2)) * 0.12 * k;
+        r *= 1 - ue; g *= 1 - ue; b *= 1 - ue;
+      }
+      // lashes: point up when open, down when closed
+      let lash = 0;
+      const sg = xx < 0 ? -1 : 1;
+      const dU = ou > 0.2 ? yUp - y : y - yUp;
+      if (dU >= 0 && dU < 0.17) {
+        const xs = (x + sg * dU * dU * 5) * 32, id = Math.floor(xs), fr = xs - id;
+        const len = (0.05 + 0.09 * Math.pow(k, 0.6)) * (0.7 + 0.5 * hash(id, 3));
+        lash = Math.max(ss(0.45, 0.15, Math.abs(fr - 0.5)) * ss(len, len * 0.5, dU),
+                        Math.exp(-((dU / 0.014) ** 2))) * ss(0, 0.1, k);
+      }
+      if (ou > 0.2) {
+        const dL = y - yLo;
+        if (dL >= 0 && dL < 0.06) {
+          const xs = (x + sg * dL * 2) * 24, id = Math.floor(xs), fr = xs - id;
+          const len = 0.035 * (0.6 + 0.6 * hash(id, 9)) * k;
+          lash = Math.max(lash, 0.6 * ss(0.4, 0.2, Math.abs(fr - 0.5)) * ss(len, len * 0.4, dL));
+        }
+      }
+      r = mix(r, 0.07, lash); g = mix(g, 0.045, lash); b = mix(b, 0.035, lash);
+    }
+    // brow
+    const yb = -0.74 - 0.12 * Math.cos(x * 1.35), dyb = y - yb;
+    if (Math.abs(dyb) < 0.12 && Math.abs(x + 0.05) < 1.12) {
+      const th = 0.085 - 0.015 * (x + 1);
+      const bm = ss(th, th * 0.4, Math.abs(dyb - 0.01 * x)) * ss(1.12, 0.92, Math.abs(x + 0.05));
+      const hair = ss(0.4, 0.7, bil(TW, x * 40 + 60 - dyb * 30, dyb * 260 + x * 50 + 20));
+      const a = bm * (0.35 + 0.6 * hair);
+      r = mix(r, 0.11, a); g = mix(g, 0.07, a); b = mix(b, 0.05, a);
+    }
+  }
+  EO.r = r; EO.g = g; EO.b = b; EO.pm = pm;
+}
+
+
+// ---------- space background ----------
+const SO = { r: 0, g: 0, b: 0, ch: -1 };
+
+function shadeSpace(u, v, t, i, j) {
+  const n1 = bil(TS, u * 28 + t * 0.6 + 40, v * 28 + 80);
+  const n2 = bil(TW, u * 14 - t * 0.4 + 10, v * 14 + 30);
+  const a1 = n1 * n1 * n1, a2 = n2 * n2 * n2 * n2;
+  let r = 0.10 * a1 + 0.16 * a2, g = 0.03 * a1 + 0.03 * a2, b = 0.16 * a1 + 0.10 * a2;
+  let c = -1;
+  // faint fixed twinkling stars
+  const hs = hash(i * 31 + 5, j * 17 + 9);
+  if (hs > 0.988) {
+    const tw = (0.55 + 0.45 * Math.sin(t * 2.5 + hs * 900)) * bgDim;
+    r += 0.35 * tw; g += 0.37 * tw; b += 0.45 * tw;
+    c = tw > 0.75 ? C_COL : C_DOT;
+  }
+  SO.r = r; SO.g = g; SO.b = b; SO.ch = c;
+}
+
+function heartbeat(t) {
+  const ph = (t % 1.15) / 1.15;
+  return Math.exp(-(((ph - 0.08) / 0.06) ** 2)) + 0.55 * Math.exp(-(((ph - 0.32) / 0.07) ** 2));
+}
+
+// 3D starfield drawn on top of the grid
+const STARS = [];
+function newStar(z) {
+  return { x: (Math.random() * 2 - 1) * 3.2, y: (Math.random() * 2 - 1) * 3.2, z, b: 0.35 + 0.65 * Math.random(), w: Math.random() };
+}
+function resetStars() {
+  STARS.length = 0;
+  for (let n = 0; n < 300; n++) STARS.push(newStar(0.3 + Math.random() * 9.7));
+}
+
+// ---------- Scorpius ----------
+// name, right ascension (h), declination (deg), magnitude
+const STAR_DATA = [
+  ['Jabbah',  16.200, -19.46, 3.9],
+  ['Acrab',   16.090, -19.81, 2.6],
+  ['Dschubba',16.006, -22.62, 2.3],
+  ['Fang',    15.981, -26.11, 2.9],
+  ['Rho',     15.948, -29.21, 3.9],
+  ['Alniyat', 16.353, -25.59, 2.9],
+  ['Antares', 16.490, -26.43, 1.0],
+  ['Tau',     16.598, -28.22, 2.8],
+  ['Larawag', 16.836, -34.29, 2.3],
+  ['Mu',      16.864, -38.05, 3.0],
+  ['Zeta',    16.910, -42.36, 3.6],
+  ['Eta',     17.203, -43.24, 3.3],
+  ['Sargas',  17.622, -43.00, 1.9],
+  ['Iota',    17.793, -40.13, 3.0],
+  ['Kappa',   17.708, -39.03, 2.4],
+  ['Shaula',  17.560, -37.10, 1.6],
+  ['Lesath',  17.513, -37.30, 2.7],
+];
+const LINES = [
+  ['Jabbah', 'Acrab'], ['Acrab', 'Dschubba'], ['Dschubba', 'Fang'], ['Fang', 'Rho'],
+  ['Dschubba', 'Alniyat'], ['Alniyat', 'Antares'], ['Antares', 'Tau'], ['Tau', 'Larawag'],
+  ['Larawag', 'Mu'], ['Mu', 'Zeta'], ['Zeta', 'Eta'], ['Eta', 'Sargas'], ['Sargas', 'Iota'],
+  ['Iota', 'Kappa'], ['Kappa', 'Shaula'], ['Shaula', 'Lesath'],
+];
+const SKY = {};       // name -> screen position and brightness
+let hintRow = 0, thumbW = 60, hintGone = false;
+
+function layoutSky() {
+  const ra0 = 16.85, dec0 = -31.3;
+  const pts = STAR_DATA.map(([n, ra, dec, mag]) => ({
+    n, mag, x: -(ra - ra0) * 15 * Math.cos(dec * Math.PI / 180), y: -(dec - dec0),
+  }));
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const s = Math.min(W * 0.68 / (x1 - x0), H * 0.56 / (y1 - y0));
+  const cx = W / 2, cy = H * 0.5;
+  for (const p of pts) {
+    SKY[p.n] = { x: cx + (p.x - (x0 + x1) / 2) * s, y: cy + (p.y - (y0 + y1) / 2) * s, b: Math.min(1.3, Math.max(0.35, 1.55 - 0.3 * p.mag)) };
+  }
+  thumbW = Math.min(90, Math.max(44, Math.min(W, H) * 0.1));
+  hintRow = Math.max(1, Math.round(26 / ch));
+}
+
+function skyPut(i, j, c, r, g, b) {
+  if (i < 0 || j < 0 || i >= cols || j >= rows) return;
+  const k = j * cols + i;
+  chars[k] = c; cr[k] = r; cg[k] = g; cb[k] = b; prot[k] = 1;
+}
+
+function textRow(str, j, t, t0, r, g, b) {
+  const i0 = Math.round(cols / 2 - str.length / 2);
+  for (let n = 0; n < str.length; n++) {
+    if (str[n] === ' ') continue;
+    const lt = t0 + 0.3 + n * 0.05;
+    const c = t >= lt ? CI.get(str[n]) : RI[1 + Math.floor(hash(n * 17 + 3, Math.floor(t * 14) * 577) * (NR - 1))];
+    skyPut(i0 + n, j, c, r, g, b);
+  }
+}
+
+function drawSky(t) {
+  drawHeartStar(SKY[HEART_STAR], t, ss(T.sky, T.sky + 1.2, t));
+  if (t > T.hint && !hintGone) {
+    const a = ss(T.hint, T.hint + 1, t) * (0.45 + 0.25 * Math.sin(t * 2.5));
+    textRow(HINT, hintRow, t, T.hint, 0.7 * a, 0.75 * a, 1 * a);
+  }
+}
+
+// Antares, "the heart of the Scorpion": a beating heart written with our names, tap opens "Я тебя люблю"
+function heartF(u, v, s) {
+  const hx = u / s, hy = -v / s + 0.1;
+  const q = hx * hx + hy * hy - 1;
+  return q * q * q - hx * hx * hy * hy * hy;
+}
+function heartSize(t) { return Math.max(40, thumbW * 0.95) * (1 + 0.1 * heartbeat(t)); }
+
+function drawHeartStar(s, t, ap) {
+  const pulse = heartbeat(t), size = heartSize(t) * ap, L = HI.length;
+  if (size < 2) return;
+  const i0 = Math.floor((s.x - size * 2) / cw), i1 = Math.ceil((s.x + size * 2) / cw);
+  const j0 = Math.floor((s.y - size * 2) / ch), j1 = Math.ceil((s.y + size * 2) / ch);
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const u = ((i + 0.5) * cw - s.x) / size, v = ((j + 0.5) * ch - s.y) / size;
+    const f = heartF(u, v, 1);
+    if (f <= 0) {
+      const hl = Math.exp(-((u + 0.5) ** 2 + (v + 0.45) ** 2) / 0.08) * 0.45;
+      const lum = (0.7 + 0.3 * Math.pow(Math.min(1, -f * 1.6), 0.35)) * (0.9 + 0.3 * pulse);
+      skyPut(i, j, HI[((i + j * 5) % L + L) % L], lum + hl, 0.22 * lum + hl, 0.36 * lum + hl);
+    } else {
+      const g = Math.exp(-f * 4) * (0.35 + 0.3 * pulse) * ap;
+      if (g > 0.06) skyPut(i, j, g > 0.2 ? C_COL : C_DOT, g * 1.4, g * 0.25, g * 0.4);
+    }
+  }
+}
+
+// Scorpius itself: crisp vector lines and glowing stars on the overlay canvas
+function drawConstellation(t, a) {
+  if (t < T.sky) return;
+  const ctx = octx, s = dpr, fade = 1 - ss(0, 0.5, a);
+  if (fade <= 0) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  // keep the heart clean: nothing is drawn inside a circle around it
+  const h = SKY[HEART_STAR];
+  ctx.beginPath(); ctx.rect(0, 0, ov.width, ov.height);
+  ctx.arc(h.x * s, h.y * s, heartSize(t) * 1.25 * s, 0, Math.PI * 2, true);
+  ctx.clip('evenodd');
+
+  // lines grow one after another, from star to star
+  const step = (T.lines1 - T.lines0) / LINES.length;
+  const gap = () => 8;
+  ctx.shadowColor = 'rgba(110,140,255,0.9)'; ctx.shadowBlur = 8 * s;
+  ctx.strokeStyle = `rgba(150,175,255,${0.6 * fade})`; ctx.lineWidth = 1.4 * s;
+  LINES.forEach(([A, B], n) => {
+    const p = clamp01((t - T.lines0 - n * step) / step);
+    if (p <= 0) return;
+    const sa = SKY[A], sb = SKY[B], dx = sb.x - sa.x, dy = sb.y - sa.y, len = Math.hypot(dx, dy);
+    const g0 = gap(A), g1 = gap(B), d1 = g0 + (len - g0 - g1) * p;
+    if (d1 <= g0) return;
+    ctx.beginPath();
+    ctx.moveTo((sa.x + dx / len * g0) * s, (sa.y + dy / len * g0) * s);
+    ctx.lineTo((sa.x + dx / len * d1) * s, (sa.y + dy / len * d1) * s);
+    ctx.stroke();
+  });
+  ctx.shadowBlur = 0;
+
+  // stars: size by brightness, warm ones carry photos
+  STAR_DATA.forEach(([n], idx) => {
+    if (n === HEART_STAR) return;
+    const ap = ss(T.sky + idx * 0.06, T.sky + idx * 0.06 + 1.2, t) * fade;
+    if (ap <= 0) return;
+    const st = SKY[n], col = n in PHOTO_BY_STAR ? '255,226,190' : '205,220,255';
+    const r = (1.2 + 2.2 * st.b) * (0.85 + 0.15 * Math.sin(t * 3 + idx * 1.7)) * s, x = st.x * s, y = st.y * s;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r * 5);
+    g.addColorStop(0, `rgba(${col},${0.9 * ap})`); g.addColorStop(0.2, `rgba(${col},${0.35 * ap})`); g.addColorStop(1, `rgba(${col},0)`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r * 5, 0, 7); ctx.fill();
+    ctx.fillStyle = `rgba(255,255,255,${ap})`; ctx.beginPath(); ctx.arc(x, y, r * 0.55, 0, 7); ctx.fill();
+    if (st.b > 0.9) {   // diffraction spikes
+      const L = r * 4.5;
+      ctx.strokeStyle = `rgba(${col},${0.45 * ap})`; ctx.lineWidth = 0.8 * s;
+      ctx.beginPath(); ctx.moveTo(x - L, y); ctx.lineTo(x + L, y); ctx.moveTo(x, y - L); ctx.lineTo(x, y + L); ctx.stroke();
+    }
+  });
+  ctx.restore();
+}
+
+// Leonids: shooting stars, they peak around her birthday every year
+const METEORS = [];
+let nextMeteor = 0;
+function drawMeteors(t) {
+  if (t < T.sky + 2) { nextMeteor = T.sky + 2 + Math.random() * 2; return; }
+  if (t > nextMeteor) {
+    const m = Math.max(W, H);
+    METEORS.push({ t0: t, x: W * (0.3 + Math.random() * 0.8), y: H * Math.random() * 0.35, vx: -(0.55 + Math.random() * 0.2) * m, vy: 0.45 * m, life: 0.9 });
+    nextMeteor = t + 2.5 + Math.random() * 4;
+  }
+  for (let n = METEORS.length - 1; n >= 0; n--) {
+    const m = METEORS[n], age = t - m.t0;
+    if (age > m.life || age < 0) { METEORS.splice(n, 1); continue; }
+    const hx = m.x + m.vx * age, hy = m.y + m.vy * age, sp = Math.hypot(m.vx, m.vy);
+    const fade = Math.sin(Math.PI * age / m.life);
+    for (let s = 0; s < 14; s++) {
+      const d = s * Math.min(cw, ch) * 0.9;
+      const br = fade * (1 - s / 14) * (s === 0 ? 1.3 : 0.8);
+      put(Math.floor((hx - m.vx / sp * d) / cw), Math.floor((hy - m.vy / sp * d) / ch), s === 0 ? C_STAR : C_SL, br, 1, 0.95, 0.85);
+    }
+  }
+}
+
+// ---------- WebGL renderer ----------
+// The whole screen is one shader pass: every pixel finds its cell, reads the cell's
+// glyph index + color from a tiny data texture and samples the glyph atlas.
+// Glow comes from the same color data, sampled blurred.
+const cv = document.getElementById('c');
+const ov = document.getElementById('ov'), octx = ov.getContext('2d');   // thumbnails on top
+const gl = cv.getContext('webgl', { alpha: false, antialias: false, premultipliedAlpha: false });
+let W, H, dpr, cols, rows, cw, ch, S, maxR, N;
+let chars, cr, cg, cb, vis, prot, cellData;
+
+// finer grid for photos and "Я тебя люблю"
+const FINE = 2.1;
+let pcols, prows, pcw, pch, pN, fineData, loveM;
+
+const AC = 16;   // glyphs per atlas row
+const VS = `attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
+const FS = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2 uRes;
+uniform sampler2D uAtlas, uCells, uGlow, uFAtlas, uFCells, uFGlow;
+uniform vec2 uCell, uGrid, uAtlasSize, uGlyph;
+uniform vec2 uFCell, uFGrid, uFAtlasSize, uFGlyph;
+uniform float uFine;
+
+vec3 layer(vec2 p, sampler2D atlas, sampler2D cells, vec2 cell, vec2 grid, vec2 atlasSize, vec2 glyph) {
+  vec2 c = floor(p / cell);
+  if (c.x >= grid.x || c.y >= grid.y) return vec3(0.0);
+  vec4 d = texture2D(cells, (c + 0.5) / grid);
+  float idx = floor(d.a * 255.0 + 0.5);
+  if (idx < 0.5) return vec3(0.0);
+  vec2 local = (p - c * cell) / cell;
+  vec2 origin = vec2(mod(idx, ${AC}.0), floor(idx / ${AC}.0)) * (glyph + 2.0) + 1.0;
+  float a = texture2D(atlas, (origin + local * glyph) / atlasSize).a;
+  return d.rgb * a;
+}
+
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);
+  vec3 col = layer(p, uAtlas, uCells, uCell, uGrid, uAtlasSize, uGlyph);
+  if (uFine > 0.5) col += layer(p, uFAtlas, uFCells, uFCell, uFGrid, uFAtlasSize, uFGlyph);
+  // glow: blurred cell colors around this pixel
+  vec2 g = p / uCell / uGrid, o = 1.0 / uGrid;
+  vec3 glow = texture2D(uGlow, g).rgb * 0.4
+            + (texture2D(uGlow, g + vec2(1.5 * o.x, 0.0)).rgb + texture2D(uGlow, g - vec2(1.5 * o.x, 0.0)).rgb
+             + texture2D(uGlow, g + vec2(0.0, 1.5 * o.y)).rgb + texture2D(uGlow, g - vec2(0.0, 1.5 * o.y)).rgb) * 0.15;
+  if (uFine > 0.5) {
+    vec2 f = p / uFCell / uFGrid, fo = 2.0 / uFGrid;
+    glow += (texture2D(uFGlow, f + vec2(fo.x, 0.0)).rgb + texture2D(uFGlow, f - vec2(fo.x, 0.0)).rgb
+           + texture2D(uFGlow, f + vec2(0.0, fo.y)).rgb + texture2D(uFGlow, f - vec2(0.0, fo.y)).rgb) * 0.3;
+  }
+  gl_FragColor = vec4(col + glow * 0.22, 1.0);
+}`;
+
+let prog, U = {}, tex = {};
+function initGL() {
+  const sh = (type, src) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog); gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  for (const n of ['uRes', 'uAtlas', 'uCells', 'uGlow', 'uFAtlas', 'uFCells', 'uFGlow', 'uCell', 'uGrid', 'uAtlasSize', 'uGlyph',
+                   'uFCell', 'uFGrid', 'uFAtlasSize', 'uFGlyph', 'uFine']) U[n] = gl.getUniformLocation(prog, n);
+  ['atlas', 'cells', 'glow', 'fatlas', 'fcells', 'fglow'].forEach((n, unit) => {
+    const t = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+    const f = n === 'cells' || n === 'fcells' ? gl.NEAREST : gl.LINEAR;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    tex[n] = { t, unit };
+  });
+  gl.uniform1i(U.uAtlas, 0); gl.uniform1i(U.uCells, 1); gl.uniform1i(U.uGlow, 2);
+  gl.uniform1i(U.uFAtlas, 3); gl.uniform1i(U.uFCells, 4); gl.uniform1i(U.uFGlow, 5);
+}
+
+function upload(name, w, h, data) {
+  const { t, unit } = tex[name];
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+  if (data instanceof Uint8Array) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, data);
+}
+
+// white glyphs in a grid of cells exactly one (device) cell big, with a 1px gutter
+function makeAtlas(fs, cellW, cellH) {
+  const gw = Math.ceil(cellW * dpr), gh = Math.ceil(cellH * dpr);
+  const c = document.createElement('canvas');
+  c.width = AC * (gw + 2); c.height = Math.ceil(CHARS.length / AC) * (gh + 2);
+  const a = c.getContext('2d');
+  a.font = `500 ${fs * dpr}px ${FONT}`;
+  a.textAlign = 'center'; a.textBaseline = 'middle'; a.fillStyle = '#fff';
+  CHARS.forEach((ch, i) => {
+    if (ch === ' ') return;
+    const x = (i % AC) * (gw + 2) + 1, y = Math.floor(i / AC) * (gh + 2) + 1;
+    a.save(); a.beginPath(); a.rect(x, y, gw, gh); a.clip();
+    a.fillText(ch, x + gw / 2, y + gh / 2 + fs * dpr * 0.04);
+    a.restore();
+  });
+  return { c, gw, gh };
+}
+
+function resize() {
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = ov.width = Math.round(W * dpr); cv.height = ov.height = Math.round(H * dpr);
+
+  cols = Math.round(Math.min(200, Math.max(70, W / 6.5)));
+  cw = W / cols;
+  const m = document.createElement('canvas').getContext('2d');
+  m.font = `500 100px ${FONT}`;
+  const adv = (m.measureText('M').width || 60) / 100;
+  const fs = cw / adv;
+  ch = fs * 1.08;
+  rows = Math.ceil(H / ch);
+  S = Math.min(W, H) / 2.1;
+  maxR = Math.hypot(W, H) / 2 / S;
+  N = cols * rows;
+
+  chars = new Uint16Array(N);
+  cr = new Float32Array(N); cg = new Float32Array(N); cb = new Float32Array(N);
+  vis = new Uint8Array(N); prot = new Uint8Array(N);
+  cellData = new Uint8Array(N * 4);
+
+  pcw = cw / FINE; pch = ch / FINE;
+  pcols = Math.ceil(W / pcw); prows = Math.ceil(H / pch); pN = pcols * prows;
+  fineData = new Uint8Array(pN * 4);
+
+  const A = makeAtlas(fs, cw, ch), F = makeAtlas(fs / FINE, pcw, pch);
+  upload('atlas', 0, 0, A.c); upload('fatlas', 0, 0, F.c);
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.uniform2f(U.uRes, cv.width, cv.height);
+  gl.uniform2f(U.uCell, cw * dpr, ch * dpr); gl.uniform2f(U.uGrid, cols, rows);
+  gl.uniform2f(U.uAtlasSize, A.c.width, A.c.height); gl.uniform2f(U.uGlyph, A.gw, A.gh);
+  gl.uniform2f(U.uFCell, pcw * dpr, pch * dpr); gl.uniform2f(U.uFGrid, pcols, prows);
+  gl.uniform2f(U.uFAtlasSize, F.c.width, F.c.height); gl.uniform2f(U.uFGlyph, F.gw, F.gh);
+
+  layoutSky();
+  buildLove();
+  photos.forEach(buildPhoto);
+}
+
+// "Я тебя люблю" as a mask on the fine grid: one, two or three lines, whichever is biggest
+function buildLove() {
+  const c = document.createElement('canvas'); c.width = Math.ceil(W); c.height = Math.ceil(H);
+  const x = c.getContext('2d');
+  const words = LOVE.split(' ');
+  const layouts = [[LOVE], [words[0] + ' ' + words[1], words[2]], words];
+  x.font = `800 100px ${FONT}`;
+  let best = null;
+  for (const lines of layouts) {
+    const wmax = Math.max(...lines.map(l => x.measureText(l).width));
+    const fs = Math.min(100 * W * 0.92 / wmax, H * 0.82 / (lines.length * 1.02));
+    if (!best || fs > best.fs) best = { lines, fs };
+  }
+  x.font = `800 ${best.fs}px ${FONT}`;
+  x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillStyle = '#fff';
+  best.lines.forEach((l, n) => x.fillText(l, W / 2, H / 2 + (n - (best.lines.length - 1) / 2) * best.fs * 1.02));
+  const d = x.getImageData(0, 0, c.width, c.height).data;
+  loveM = new Uint8Array(pN);
+  for (let j = 0; j < prows; j++) for (let i = 0; i < pcols; i++) {
+    const px = Math.floor((i + 0.5) * pcw), py = Math.floor((j + 0.5) * pch);
+    if (px < c.width && py < c.height) loveM[j * pcols + i] = d[(py * c.width + px) * 4 + 3] > 100 ? 1 : 0;
+  }
+}
+
+// ---------- photos ----------
+function makeMock(n) {
+  const c = document.createElement('canvas'); c.width = 600; c.height = 760;
+  const x = c.getContext('2d');
+  const scenes = [
+    ['#ff9a5a', '#5b2a6e', '#1d2b53'],   // sunset at the sea
+    ['#0b1030', '#2a3a72', '#141414'],   // night city
+    ['#bfe3a5', '#4f8a3c', '#2d4f22'],   // park
+    ['#e8f3ff', '#9cc3e6', '#f4f7fb'],   // snow
+    ['#f3c98b', '#a0522d', '#4a2a17'],   // cafe
+  ];
+  const [top, bottom, ground] = scenes[n % scenes.length];
+  const g = x.createLinearGradient(0, 0, 0, 760);
+  g.addColorStop(0, top); g.addColorStop(1, bottom);
+  x.fillStyle = g; x.fillRect(0, 0, 600, 760);
+  x.fillStyle = 'rgba(255,240,200,.9)'; x.beginPath(); x.arc(140 + n * 80, 170, 60, 0, 7); x.fill();
+  x.fillStyle = ground; x.fillRect(0, 520, 600, 240);
+  for (const [px, col] of [[250, '#2a1a1a'], [365, '#3b2420']]) {
+    x.fillStyle = col;
+    x.beginPath(); x.arc(px, 375, 44, 0, 7); x.fill();
+    x.beginPath(); x.ellipse(px, 560, 78, 140, 0, 0, 7); x.fill();
+  }
+  x.fillStyle = 'rgba(255,255,255,.9)'; x.font = '800 56px sans-serif'; x.textAlign = 'center';
+  x.fillText(`фото ${n + 2}`, 300, 705);
+  return c;
+}
+
+const photos = PHOTOS.map(cfg => ({ crop: { x: 0, y: 0, w: 1, h: 1 }, side: 'up', ...cfg, img: null, thumb: null, rect: null, M: null }));
+const PHOTO_BY_STAR = {};
+photos.forEach((p, n) => { PHOTO_BY_STAR[p.star] = n; });
+
+function sampleImage(p, gc, gr, gcw, gch) {
+  const im = p.img, nw = im.naturalWidth || im.width, nh = im.naturalHeight || im.height;
+  const sx0 = nw * p.crop.x, sy0 = nh * p.crop.y, iw = nw * p.crop.w, ih = nh * p.crop.h;
+  const r = p.rect, tw = r.w / gcw, th = r.h / gch;
+  // halve step by step for a clean downscale on every browser
+  let src = im, sw = iw, sh = ih, ox = sx0, oy = sy0;
+  while (sw > tw * 2 && sh > th * 2) {
+    const c = document.createElement('canvas');
+    c.width = Math.ceil(sw / 2); c.height = Math.ceil(sh / 2);
+    c.getContext('2d').drawImage(src, ox, oy, sw, sh, 0, 0, c.width, c.height);
+    src = c; sw = c.width; sh = c.height; ox = 0; oy = 0;
+  }
+  const c = document.createElement('canvas'); c.width = gc; c.height = gr;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(src, ox, oy, sw, sh, r.x / gcw, r.y / gch, tw, th);
+  return x.getImageData(0, 0, gc, gr).data;
+}
+
+function buildPhoto(p) {
+  if (!p.img || !W) return;
+  const nw = p.img.naturalWidth || p.img.width, nh = p.img.naturalHeight || p.img.height;
+  const iw = nw * p.crop.w, ih = nh * p.crop.h;
+  p.aspect = ih / iw;
+  const sc = Math.min(W * 0.92 / iw, H * 0.8 / ih);
+  p.rect = { w: iw * sc, h: ih * sc, x: (W - iw * sc) / 2, y: (H - ih * sc) / 2 };
+
+  // tiny pixelated thumbnail
+  const t = document.createElement('canvas');
+  t.width = 22; t.height = Math.max(1, Math.round(22 * p.aspect));
+  const tx = t.getContext('2d'); tx.imageSmoothingQuality = 'high';
+  tx.drawImage(p.img, nw * p.crop.x, nh * p.crop.y, iw, ih, 0, 0, t.width, t.height);
+  p.thumb = t;
+
+  const db = sampleImage(p, cols, rows, cw, ch);
+  p.baseM = new Uint8Array(N);
+  for (let k = 0; k < N; k++) p.baseM[k] = db[k * 4 + 3] >= 128 ? 1 : 0;
+  toneMap(p, sampleImage(p, pcols, prows, pcw, pch), pN, pcols, prows);
+}
+
+// unsharp mask + contrast stretch + saturation, so faces survive the letter grid
+function toneMap(p, d, N, cols, rows) {
+  const M = new Uint8Array(N), R = new Float32Array(N), G = new Float32Array(N), B = new Float32Array(N);
+  const L = new Float32Array(N), Ls = new Float32Array(N), vals = [];
+  for (let k = 0; k < N; k++) {
+    if (d[k * 4 + 3] < 128) continue;
+    M[k] = 1;
+    L[k] = (0.3 * d[k * 4] + 0.59 * d[k * 4 + 1] + 0.11 * d[k * 4 + 2]) / 255;
+  }
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const k = j * cols + i;
+    if (!M[k]) continue;
+    let s = 0, n = 0;
+    for (let b = -1; b <= 1; b++) for (let a = -1; a <= 1; a++) {
+      const ii = i + a, jj = j + b, q = jj * cols + ii;
+      if (ii >= 0 && jj >= 0 && ii < cols && jj < rows && M[q]) { s += L[q]; n++; }
+    }
+    Ls[k] = L[k] + 1.2 * (L[k] - s / n);
+    vals.push(Ls[k]);
+  }
+  vals.sort((a, b) => a - b);
+  const lo = vals[Math.floor(vals.length * 0.03)] || 0, hi = vals[Math.floor(vals.length * 0.97)] || 1;
+  for (let k = 0; k < N; k++) {
+    if (!M[k]) continue;
+    const l = Math.max(0.02, L[k]);
+    const v = Math.pow(clamp01((Ls[k] - lo) / (hi - lo)), 1.15) * 0.85 + 0.03;
+    const sat = c => Math.max(0, l + (c / 255 - l) * 1.35) / l;
+    R[k] = Math.min(1, sat(d[k * 4]) * v);
+    G[k] = Math.min(1, sat(d[k * 4 + 1]) * v);
+    B[k] = Math.min(1, sat(d[k * 4 + 2]) * v);
+  }
+  Object.assign(p, { M, R, G, B });
+}
+
+function thumbRect(p, n, t) {
+  const s = SKY[p.star], w = thumbW, h = thumbW * p.aspect, gap = 12;
+  let x, y;
+  if (p.side === 'down') { x = s.x - w / 2; y = s.y + gap; }
+  else if (p.side === 'right') { x = s.x + gap; y = s.y - h / 2; }
+  else if (p.side === 'left') { x = s.x - gap - w; y = s.y - h / 2; }
+  else { x = s.x - w / 2; y = s.y - gap - h; }
+  x = Math.min(W - w - 6, Math.max(6, x));
+  y = Math.min(H - h - 6, Math.max(6, y)) + Math.sin(t * 1.3 + n * 1.9) * 2.5;
+  return { x, y, w, h };
+}
+const lerpRect = (a, b, q) => ({ x: mix(a.x, b.x, q), y: mix(a.y, b.y, q), w: mix(a.w, b.w, q), h: mix(a.h, b.h, q) });
+
+// ---------- open view: a photo or "Я тебя люблю" ----------
+let V = null;   // { kind: 'photo' | 'love', idx, openT, closing, closeT }
+
+function viewAmount(t) {
+  if (!V || (V.kind === 'photo' && !photos[V.idx].M)) return 0;
+  let a = ss(V.openT + 0.25, V.openT + 1.7, t);
+  if (V.closing) {
+    if (t > V.closeT + 1.0) { V = null; return 0; }
+    a *= 1 - ss(V.closeT, V.closeT + 0.9, t);
+  }
+  return a;
+}
+function viewOrigin() {
+  if (V.kind === 'love') return SKY[HEART_STAR];
+  const r = photos[V.idx].rect;
+  return { x: r.x + r.w / 2, y: r.y + r.h / 2 };
+}
+
+// cells appear around the origin, scramble, then settle into our names
+function drawFine(t, a) {
+  const d = fineData, Rm = Math.hypot(W, H), R = a * Rm * 1.05, o = viewOrigin();
+  const p = V.kind === 'photo' ? photos[V.idx] : null;
+  const src = NI, L = src.length, tick = Math.floor(t * 14);
+  const pulse = heartbeat(t);
+  for (let j = 0; j < prows; j++) for (let i = 0; i < pcols; i++) {
+    const k = j * pcols + i, q = k * 4;
+    let c = SP, r = 0, g = 0, b = 0;
+    const px = (i + 0.5) * pcw, py = (j + 0.5) * pch, dist = Math.hypot(px - o.x, py - o.y);
+    if ((!p || p.M[k]) && dist < R * (0.88 + 0.24 * hash(i * 3 + 7, j * 11 + 5))) {
+      if (p) { r = p.R[k]; g = p.G[k]; b = p.B[k]; }
+      else if (loveM[k]) {
+        const v = (0.8 + 0.2 * Math.sin(py / H * 3 + px / W * 2 - t * 1.5)) * (1 + 0.3 * pulse);
+        r = v; g = 0.22 * v; b = 0.4 * v;
+      } else { r = 0.16; g = 0.025; b = 0.06; }
+      const lockT = V.openT + 0.5 + dist / Rm * 1.4 + hash(i * 5 + 1, j * 9 + 2) * 0.6;
+      if (t >= lockT) {
+        c = src[((i + j * 5) % L + L) % L];
+        const fl = Math.exp(-(t - lockT) * 5) * 0.7;
+        r += fl; g += fl; b += fl;
+      } else {
+        c = RI[1 + Math.floor(hash(i * 17 + 3, j * 7 + tick * 577) * (NR - 1))];
+        r *= 0.5; g *= 0.5; b *= 0.5;
+      }
+    }
+    d[q] = Math.min(255, r * 330); d[q + 1] = Math.min(255, g * 330); d[q + 2] = Math.min(255, b * 330); d[q + 3] = c;
+  }
+  upload('fcells', pcols, prows, d);
+  upload('fglow', pcols, prows, d);
+}
+
+// little pixel photos over their stars; the opened one flies to full size
+function drawThumbs(t, a) {
+  const ctx = octx, s = dpr;
+  if (t < T.thumbs) return;
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  photos.forEach((p, n) => {
+    if (!p.thumb) return;
+    let al = ss(T.thumbs + n * 0.3, T.thumbs + n * 0.3 + 0.8, t), thread = true;
+    let r = thumbRect(p, n, t);
+    if (V && V.kind === 'photo' && V.idx === n) {
+      let q, fa;
+      if (!V.closing) { q = ss(V.openT, V.openT + 0.75, t); fa = 1 - ss(V.openT + 0.6, V.openT + 1.4, t); }
+      else { q = 1 - ss(V.closeT + 0.3, V.closeT + 1.0, t); fa = ss(V.closeT + 0.2, V.closeT + 0.7, t); }
+      r = lerpRect(r, p.rect, q); al *= fa; thread = q < 0.05;
+    } else al *= 1 - ss(0, 0.5, a);
+    if (al <= 0.01) return;
+    const st = SKY[p.star];
+    if (thread) {
+      ctx.globalAlpha = al * 0.3; ctx.strokeStyle = '#cfd8ff'; ctx.lineWidth = s;
+      ctx.beginPath();
+      ctx.moveTo(st.x * s, st.y * s);
+      ctx.lineTo(Math.min(r.x + r.w, Math.max(r.x, st.x)) * s, Math.min(r.y + r.h, Math.max(r.y, st.y)) * s);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = al;
+    ctx.drawImage(p.thumb, r.x * s, r.y * s, r.w * s, r.h * s);
+    ctx.globalAlpha = al * 0.45; ctx.strokeStyle = '#fff'; ctx.lineWidth = s;
+    ctx.strokeRect(r.x * s, r.y * s, r.w * s, r.h * s);
+  });
+  ctx.restore();
+}
+
+function hitTest(x, y, t) {
+  if (t < T.thumbs) return null;
+  let best = null, bd = 1e9;
+  photos.forEach((p, n) => {
+    if (!p.thumb) return;
+    const r = thumbRect(p, n, t), s = SKY[p.star];
+    const inR = x > r.x - 8 && x < r.x + r.w + 8 && y > r.y - 8 && y < r.y + r.h + 8;
+    const d = inR ? 0 : Math.hypot(x - s.x, y - s.y);
+    if (d < 30 && d < bd) { bd = d; best = { kind: 'photo', idx: n }; }
+  });
+  const h = SKY[HEART_STAR], dh = Math.hypot(x - h.x, y - h.y);
+  if (dh < Math.max(38, heartSize(t) * 1.4) && dh < bd) best = { kind: 'love', idx: -1 };
+  return best;
+}
+
+// ---------- drift stars ----------
+function put(i, j, c, br, r, g, b) {
+  if (i < 0 || j < 0 || i >= cols || j >= rows) return;
+  const k = j * cols + i;
+  if (!vis[k] || prot[k]) return;
+  if (0.3 * cr[k] + 0.59 * cg[k] + 0.11 * cb[k] > br * 0.9) return;
+  chars[k] = c; cr[k] = r * br; cg[k] = g * br; cb[k] = b * br;
+}
+
+function drawStars(dt, speed) {
+  for (const s of STARS) {
+    s.z -= speed * dt;
+    if (s.z < 0.25) { Object.assign(s, newStar(10)); continue; }
+    const br = s.b * ss(10, 5, s.z) * Math.min(1.5, 1.8 / s.z) * bgDim;
+    const px = W / 2 + s.x / s.z * S, py = H / 2 + s.y / s.z * S;
+    const ci = Math.floor(px / cw), cj = Math.floor(py / ch);
+    if (ci < -8 || cj < -8 || ci > cols + 8 || cj > rows + 8) continue;
+    const r0 = 0.8 + 0.2 * s.w, g0 = 0.85, b0 = 1.0 - 0.25 * s.w;
+    if (speed > 1.5) { // warp streaks
+      const z2 = s.z + speed * 0.07;
+      const qx = W / 2 + s.x / z2 * S, qy = H / 2 + s.y / z2 * S;
+      const steps = Math.min(8, Math.ceil(Math.max(Math.abs(px - qx) / cw, Math.abs(py - qy) / ch)));
+      for (let m = 1; m <= steps; m++) {
+        const f = m / (steps + 1);
+        put(Math.floor(mix(px, qx, f) / cw), Math.floor(mix(py, qy, f) / ch), C_DOT, br * (1 - f) * 0.8, r0, g0, b0);
+      }
+    }
+    put(ci, cj, br > 0.95 ? C_PLUS : br > 0.6 ? C_STAR : br > 0.3 ? C_COL : C_DOT, br, r0, g0, b0);
+    if (br > 0.95) { // diffraction spikes
+      const L = br > 1.25 ? 3 : 2;
+      for (let m = 1; m <= L; m++) {
+        const a = br * (1 - m / (L + 1)) * 0.8;
+        put(ci - m, cj, C_H, a, r0, g0, b0); put(ci + m, cj, C_H, a, r0, g0, b0);
+        if (m < L) { put(ci, cj - m, C_V, a, r0, g0, b0); put(ci, cj + m, C_V, a, r0, g0, b0); }
+      }
+    }
+  }
+}
+
+// ---------- eye movement ----------
+// where the eye looks: [time, x, y], x > 0 is right, y > 0 is down
+const GAZE = [
+  [0,    0.02,  0.10],   // wakes up looking down
+  [3.9,  0,     0],      // ...then at you
+  [4.9, -0.15,  0.09],   // down-left
+  [5.8,  0.15, -0.08],   // up-right
+  [6.6,  0,     0],      // back at you, holds the look
+];
+
+// saccades: quick jump (duration grows with distance), slight overshoot, then fixation
+// with tiny microsaccades and drift, like a real eye
+function gaze(t) {
+  let n = 0;
+  while (n + 1 < GAZE.length && t >= GAZE[n + 1][0]) n++;
+  let [, x, y] = GAZE[n];
+  if (n > 0) {
+    const [t0] = GAZE[n], [, px, py] = GAZE[n - 1];
+    const dur = 0.045 + 0.35 * Math.hypot(x - px, y - py);
+    const p = clamp01((t - t0) / dur);
+    const q = clamp01((t - t0 - dur * 0.8) / 0.14);
+    const e = 1 - Math.pow(1 - p, 3) + 0.06 * Math.sin(Math.PI * q);
+    x = mix(px, x, e); y = mix(py, y, e);
+  }
+  const live = ss(T.open0, T.open1, t) * (1 - ss(T.zoom - 0.8, T.zoom, t));
+  const ms = Math.floor(t * 2.3);
+  x += live * (0.007 * (hash(ms, 11) - 0.5) + 0.003 * Math.sin(t * 1.7));
+  y += live * (0.007 * (hash(ms, 23) - 0.5) + 0.003 * Math.sin(t * 1.3 + 1));
+  return [x, y];
+}
+
+// ---------- frame ----------
+const SKIP = Math.max(0, parseFloat(QS.get('t')) || 0);   // ?t=15 jumps ahead
+const STILL = QS.has('still');                              // ?still freezes time (for screenshots)
+let start = 0, last = 0, ready = false, running = false, hiddenAt = 0, curT = 0, bgDim = 1;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!ready || !running) return;
+  const t = STILL ? SKIP : (now - start) / 1000;
+  const dt = Math.min(0.05, Math.max(0, (now - last) / 1000)); last = now;
+  curT = t;
+
+  // eye state
+  const blink = ss(T.blink0, T.blink0 + 0.14, t) * ss(T.blink1, T.blink1 - 0.18, t);
+  E.ou = ss(T.open0, T.open1, t) * (1 - blink);
+  const [gx, gy] = gaze(t);
+  E.gx = gx; E.gy = gy;
+  E.cx = gx; E.cy = -0.08 + gy;
+  E.rp = 0.105 + 0.035 * ss(T.zoom - 0.6, T.zoom + 1.2, t);
+  E.hl = 1 - ss(T.zoom, T.zoom + 1.2, t);
+
+  // camera dive
+  const ez = clamp01((t - T.zoom) / T.zoomLen);
+  const zoom = Math.exp(5.5 * ez * ez);
+  const camT = ss(T.zoom, T.zoom + 1.4, t);
+  const camX = E.cx * camT, camY = E.cy * camT;
+  const full = E.rp * zoom > maxR * 1.15;
+  const spaceWin = ss(T.zoom - 0.8, T.zoom + 0.6, t);
+
+  const fade = ss(0, 1.5, t);
+  const jit = t < T.zoom ? mix(7, 1.5, ss(0.5, 4.5, t)) : 1.0;
+  const fr = Math.floor(t * 12);
+
+  for (let j = 0; j < rows; j++) {
+    const v = ((j + 0.5) * ch - H / 2) / S;
+    for (let i = 0; i < cols; i++) {
+      const u = ((i + 0.5) * cw - W / 2) / S;
+      const k = j * cols + i;
+      let r = 0, g = 0, b = 0, sm = 1, ov = -1;
+      if (!full) {
+        shadeEye(camX + u / zoom, camY + v / zoom);
+        r = EO.r; g = EO.g; b = EO.b; sm = EO.pm * spaceWin;
+      }
+      if (sm > 0.001) {
+        shadeSpace(u, v, t, i, j);
+        r = mix(r, SO.r, sm); g = mix(g, SO.g, sm); b = mix(b, SO.b, sm);
+        if (sm > 0.5) ov = SO.ch;
+      }
+      vis[k] = sm > 0.5 ? 1 : 0; prot[k] = 0;
+      r *= fade; g *= fade; b *= fade;
+      if (ov < 0) {
+        const lum = 0.3 * r + 0.59 * g + 0.11 * b;
+        if (lum < 0.035) ov = SP;
+        else {
+          const x = Math.round(Math.pow(Math.min(1, lum * 1.3), 0.8) * (NR - 1) + (hash(i * 13 + 7, j * 29 + fr * 911) - 0.5) * jit);
+          ov = RI[x < 1 ? 1 : x > NR - 1 ? NR - 1 : x];
+        }
+      }
+      chars[k] = ov; cr[k] = r; cg[k] = g; cb[k] = b;
+    }
+  }
+
+  const speed = 0.3 + 6.5 * ss(T.zoom, T.zoom + 1.5, t) * (1 - ss(T.zoom + 2.4, T.zoom + 5, t));
+  bgDim = 1 - 0.5 * ss(T.sky, T.sky + 2, t);   // background steps back once Scorpius lights up
+  drawStars(dt, speed);
+  if (t > T.sky) { drawSky(t); drawMeteors(t); }
+
+  // an open photo / love text: clear the cells under it and fade the rest of the sky out
+  const a = viewAmount(t);
+  if (a > 0) {
+    const R = a * Math.hypot(W, H) * 1.05, o = viewOrigin(), dim = 1 - ss(0, 0.5, a);
+    const bm = V.kind === 'photo' ? photos[V.idx].baseM : null;
+    for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+      const k = j * cols + i, dx = (i + 0.5) * cw - o.x, dy = (j + 0.5) * ch - o.y;
+      if (dx * dx + dy * dy < R * R && (!bm || bm[k])) chars[k] = SP;
+      else { cr[k] *= dim; cg[k] *= dim; cb[k] *= dim; }
+    }
+  }
+
+  // cells -> data texture (rgb = color, a = glyph index), one shader pass draws everything
+  const d = cellData;
+  for (let k = 0, q = 0; k < N; k++, q += 4) {
+    const c = chars[k];
+    if (c === SP) { d[q] = d[q + 1] = d[q + 2] = d[q + 3] = 0; continue; }
+    d[q] = Math.min(255, cr[k] * 330); d[q + 1] = Math.min(255, cg[k] * 330); d[q + 2] = Math.min(255, cb[k] * 330); d[q + 3] = c;
+  }
+  upload('cells', cols, rows, d);
+  upload('glow', cols, rows, d);
+  if (a > 0) drawFine(t, a);
+  gl.uniform1f(U.uFine, a > 0 ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  octx.clearRect(0, 0, ov.width, ov.height);
+  drawConstellation(t, a);
+  drawThumbs(t, a);
+  if (song.started && !song.webAudio) song.volume = VOLUME * ss(0, 2.5, t);   // fade in
+}
+
+// ---------- input ----------
+cv.addEventListener('pointerdown', e => {
+  if (!ready) return;
+  const t = curT;
+  if (V) {
+    if (!V.closing && t > V.openT + 0.8) { V.closing = true; V.closeT = t; }
+    return;
+  }
+  const h = hitTest(e.clientX, e.clientY, t);
+  if (h) { V = { ...h, openT: t, closing: false, closeT: 0 }; hintGone = true; }
+});
+cv.addEventListener('pointermove', e => {
+  if (ready) cv.style.cursor = V || hitTest(e.clientX, e.clientY, curT) ? 'pointer' : 'default';
+});
+
+function restart() { last = performance.now(); start = last - SKIP * 1000; resetStars(); }
+
+// ---------- music ----------
+const VOLUME = 0.3;   // 0..1
+const song = new Audio('song.mp3');
+song.loop = true; song.preload = 'auto';
+
+function startSong() {
+  song.started = true;
+  // iPhone ignores audio.volume, so there the sound goes through a Web Audio gain
+  song.volume = 0.5;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (song.volume !== 0.5 && AC) {
+    const ac = new AC(), g = ac.createGain();
+    g.gain.setValueAtTime(0, ac.currentTime);
+    g.gain.linearRampToValueAtTime(VOLUME, ac.currentTime + 2.5);
+    ac.createMediaElementSource(song).connect(g).connect(ac.destination);
+    song.webAudio = ac;
+  } else song.volume = 0;
+  song.currentTime = 0;
+  song.play().catch(() => {});
+}
+
+// sound can only start from a tap, so the show begins with "коснись"
+const startEl = document.getElementById('start');
+startEl.addEventListener('click', () => {
+  startEl.hidden = true;
+  startSong();
+  restart();
+  running = true;
+});
+
+window.addEventListener('resize', () => { if (ready) resize(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    hiddenAt = performance.now();
+    if (song.started) song.pause();
+  } else if (hiddenAt) {
+    const d = performance.now() - hiddenAt; start += d; last += d; hiddenAt = 0;
+    if (song.started) song.play().catch(() => {});
+  }
+});
+
+(async () => {
+  try {
+    await Promise.race([
+      Promise.all([
+        document.fonts.load(`500 16px "JetBrains Mono"`, NAMES + HEART_NAMES + HINT),
+        document.fonts.load(`800 16px "JetBrains Mono"`, LOVE),
+      ]),
+      new Promise(r => setTimeout(r, 1500)),
+    ]);
+  } catch (e) { /* fall back to system monospace */ }
+  photos.forEach(p => {
+    if (!p.src) { p.img = makeMock(p.mock); return; }
+    const im = new Image();
+    im.onload = () => { p.img = im; if (ready) buildPhoto(p); };
+    im.src = p.src;
+  });
+  initGL();
+  resize();
+  restart();
+  // jumping into the timeline (?t=, ?still) is for testing: no start screen, no music
+  if (SKIP > 0 || STILL) { startEl.hidden = true; running = true; }
+  // ?open=0..5 or ?open=love shows a view right away (for screenshots)
+  const op = QS.get('open');
+  if (op) V = { kind: op === 'love' ? 'love' : 'photo', idx: op === 'love' ? -1 : +op, openT: SKIP - 10, closing: false, closeT: 0 };
+  ready = true;
+  requestAnimationFrame(frame);
+})();
+})();
+</script>
+</body>
+</html>
